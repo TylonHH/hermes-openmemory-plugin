@@ -11,7 +11,7 @@ Docker deployment guide: See README.md in this directory
 Config via environment variables:
   OPENMEMORY_API_URL     — Base URL (required, e.g., http://localhost:8765)
   OPENMEMORY_APP_ID      — App identifier (default: hermes)
-  OPENMEMORY_USER_ID     — User identifier (default: hermes-user)
+  OPENMEMORY_USER_ID     — User identifier (default: hermes)
   OPENMEMORY_API_KEY     — Optional API key for auth
 
 Or via $HERMES_HOME/openmemory.json.
@@ -53,7 +53,7 @@ def _load_config() -> dict:
     config = {
         "api_url": os.environ.get("OPENMEMORY_API_URL", ""),
         "app_id": os.environ.get("OPENMEMORY_APP_ID", "hermes"),
-        "user_id": os.environ.get("OPENMEMORY_USER_ID", "hermes-user"),
+        "user_id": os.environ.get("OPENMEMORY_USER_ID", "hermes"),
         "api_key": os.environ.get("OPENMEMORY_API_KEY", ""),
     }
 
@@ -125,7 +125,7 @@ class OpenMemoryProvider(MemoryProvider):
         self._config = None
         self._api_url = ""
         self._app_id = "hermes"
-        self._user_id = "hermes-user"
+        self._user_id = "hermes"
         self._api_key = ""
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
@@ -210,11 +210,11 @@ class OpenMemoryProvider(MemoryProvider):
 
         try:
             if method == "GET":
-                resp = requests.get(url, headers=headers, timeout=10)
+                resp = requests.get(url, headers=headers, timeout=45)
             elif method == "POST":
-                resp = requests.post(url, headers=headers, json=json_data, timeout=10)
+                resp = requests.post(url, headers=headers, json=json_data, timeout=45)
             elif method == "PUT":
-                resp = requests.put(url, headers=headers, json=json_data, timeout=10)
+                resp = requests.put(url, headers=headers, json=json_data, timeout=45)
             else:
                 return {"error": f"Unsupported method: {method}"}
 
@@ -262,26 +262,87 @@ class OpenMemoryProvider(MemoryProvider):
             self._prefetch_thread = threading.Thread(target=_fetch, daemon=True)
             self._prefetch_thread.start()
 
-    def _get_all_memories(self) -> str:
-        """Fetch all memories for the user."""
-        endpoint = f"/api/v1/memories/?user_id={self._user_id}&app_id={self._app_id}"
-        result = self._api_request("GET", endpoint)
+    def _fallback_app_memories(self) -> List[Dict[str, Any]] | str:
+        """Read memories through OpenMemory's app-scoped endpoint.
 
+        This endpoint avoids several generic /api/v1/memories/ bugs in
+        self-hosted OpenMemory builds, including UUID/name mismatches and
+        PostgreSQL DISTINCT ON ordering errors.
+        """
+        import urllib.parse
+
+        encoded = urllib.parse.urlencode({"user_id": self._user_id})
+        apps = self._api_request("GET", "/api/v1/apps/")
+        if "error" in apps:
+            logger.error("OpenMemory app list fetch failed: %s", apps["error"])
+            return apps["error"]
+
+        app_uuid = None
+        for app in apps.get("apps", []):
+            if app.get("name") == self._app_id or app.get("id") == self._app_id:
+                app_uuid = app.get("id")
+                break
+        if not app_uuid:
+            return f"app {self._app_id!r} not found"
+
+        result = self._api_request("GET", f"/api/v1/apps/{app_uuid}/memories?{encoded}")
         if "error" in result:
-            logger.error("OpenMemory profile fetch failed: %s", result["error"])
+            logger.error("OpenMemory app memories fetch failed: %s", result["error"])
+            return result["error"]
+        return result.get("memories", result.get("items", []))
+
+    def _get_all_memories(self) -> str:
+        """Fetch all memories for the configured user/app.
+
+        Some OpenMemory versions return HTTP 500 from the generic
+        /api/v1/memories/?user_id=... endpoint when app_id is omitted or when
+        app_id filtering hits UUID/name mismatches.  Fall back to resolving the
+        app name to its UUID and reading /api/v1/apps/{app_uuid}/memories.
+        """
+        import datetime
+        import urllib.parse
+
+        def _format_items(items):
+            if not items:
+                return "No memories stored yet."
+            lines = []
+            for mem in items:
+                content = mem.get("content", mem.get("memory", ""))
+                ts = mem.get("created_at", 0)
+                if isinstance(ts, str):
+                    created = ts[:10]
+                else:
+                    try:
+                        created = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+                    except (OSError, ValueError, TypeError):
+                        created = "unknown"
+                lines.append(f"- {content} (stored: {created})")
+            return "\n".join(lines)
+
+        encoded = urllib.parse.urlencode({"user_id": self._user_id})
+        result = self._api_request("GET", f"/api/v1/memories/?{encoded}")
+        if "error" not in result:
+            return _format_items(result.get("items", []))
+
+        logger.warning("OpenMemory generic profile fetch failed, trying app fallback: %s", result["error"])
+        apps = self._api_request("GET", "/api/v1/apps/")
+        if "error" in apps:
+            logger.error("OpenMemory app list fetch failed: %s", apps["error"])
             return tool_error(f"Memory fetch failed: {result['error']}")
 
-        memories = result.get("data", [])
-        if not memories:
-            return "No memories stored yet."
+        app_uuid = None
+        for app in apps.get("apps", []):
+            if app.get("name") == self._app_id or app.get("id") == self._app_id:
+                app_uuid = app.get("id")
+                break
+        if not app_uuid:
+            return tool_error(f"Memory fetch failed: app {self._app_id!r} not found")
 
-        lines = []
-        for mem in memories:
-            content = mem.get("memory", "")
-            created = mem.get("created_at", "")
-            lines.append(f"- {content} (stored: {created[:10]})")
-
-        return "\n".join(lines)
+        result = self._api_request("GET", f"/api/v1/apps/{app_uuid}/memories?{encoded}")
+        if "error" in result:
+            logger.error("OpenMemory app profile fetch failed: %s", result["error"])
+            return tool_error(f"Memory fetch failed: {result['error']}")
+        return _format_items(result.get("memories", result.get("items", [])))
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         """Dispatch tool calls to appropriate handlers."""
@@ -309,32 +370,47 @@ class OpenMemoryProvider(MemoryProvider):
             return tool_error(f"Unknown tool: {tool_name}")
 
     def _search_memories(self, query: str, top_k: int = 10) -> str:
-        """Search memories semantically."""
+        """Search memories.
+
+        Prefer OpenMemory's filter endpoint.  Some self-hosted versions return
+        HTTP 500 from that route due to a PostgreSQL DISTINCT ON / ORDER BY
+        mismatch.  In that case, fall back to the app-scoped memories endpoint
+        and do a lightweight client-side substring filter so the tool remains
+        usable for read/search.
+        """
         if not query:
             return tool_error("Search query cannot be empty.")
 
+        limit = min(top_k, 50)
         endpoint = "/api/v1/memories/filter"
         payload = {
             "user_id": self._user_id,
-            "app_id": self._app_id,
-            "query": query,
-            "limit": min(top_k, 50),
+            "search_query": query,
+            "size": limit,
         }
 
         result = self._api_request("POST", endpoint, payload)
 
         if "error" in result:
-            return tool_error(f"Search failed: {result['error']}")
+            logger.warning("OpenMemory filter search failed, trying app fallback: %s", result["error"])
+            items = self._fallback_app_memories()
+            if isinstance(items, str):
+                return tool_error(f"Search failed: {result['error']}")
+            needle = query.casefold()
+            items = [
+                mem for mem in items
+                if needle in mem.get("content", mem.get("memory", "")).casefold()
+            ][:limit]
+        else:
+            items = result.get("items", [])
 
-        memories = result.get("data", [])
-        if not memories:
+        if not items:
             return "No matching memories found."
 
         lines = []
-        for i, mem in enumerate(memories, 1):
-            content = mem.get("memory", "")
-            score = mem.get("score", 0.0)
-            lines.append(f"{i}. {content} (relevance: {score:.2f})")
+        for i, mem in enumerate(items, 1):
+            content = mem.get("content", mem.get("memory", ""))
+            lines.append(f"{i}. {content}")
 
         return "\n".join(lines)
 
@@ -346,16 +422,26 @@ class OpenMemoryProvider(MemoryProvider):
         endpoint = "/api/v1/memories/"
         payload = {
             "user_id": self._user_id,
-            "app_id": self._app_id,
-            "memory": content,
+            "text": content.rstrip("."),
+            "app": self._app_id,
+            "metadata": {"source": "hermes"},
+            "infer": False,
         }
 
         result = self._api_request("POST", endpoint, payload)
 
-        if "error" in result:
+        if result is None:
+            return tool_error("Failed to store memory: OpenMemory returned null (no persisted memory).")
+        if isinstance(result, dict) and "error" in result:
             return tool_error(f"Failed to store memory: {result['error']}")
 
-        memory_id = result.get("data", {}).get("id", "")
+        if isinstance(result, dict):
+            memory_id = result.get("id")
+            if not memory_id:
+                items = result.get("items", [])
+                memory_id = items[0].get("id", "unknown") if items else "unknown"
+        else:
+            memory_id = "unknown"
         return json.dumps({
             "success": True,
             "memory_id": memory_id,

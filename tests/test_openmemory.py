@@ -163,5 +163,34 @@ def test_handle_tool_call_unknown_tool():
         assert "Unknown tool" in result
 
 
+def test_search_falls_back_to_app_memories_when_filter_endpoint_fails():
+    """OpenMemory search remains usable when /memories/filter returns 500."""
+    from plugins.memory.openmemory import OpenMemoryProvider
+
+    provider = OpenMemoryProvider()
+    provider._api_url = "http://localhost:8765"
+    provider._app_id = "hermes"
+    provider._user_id = "test-user"
+
+    responses = [
+        {"error": "HTTP 500: Internal Server Error"},
+        {"apps": [{"id": "app-uuid", "name": "hermes"}]},
+        {"memories": [
+            {"content": "Docker OpenMemory uses mistralai/mistral-nemo"},
+            {"content": "Unrelated memory"},
+        ]},
+    ]
+
+    with patch.object(provider, "_api_request", side_effect=responses) as api_request:
+        result = provider._search_memories("mistralai", top_k=5)
+
+    assert "Docker OpenMemory uses mistralai/mistral-nemo" in result
+    assert "Unrelated memory" not in result
+    assert api_request.call_args_list[0].args[0:2] == ("POST", "/api/v1/memories/filter")
+    assert api_request.call_args_list[1].args[0:2] == ("GET", "/api/v1/apps/")
+    assert api_request.call_args_list[2].args[0] == "GET"
+    assert "/api/v1/apps/app-uuid/memories" in api_request.call_args_list[2].args[1]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
